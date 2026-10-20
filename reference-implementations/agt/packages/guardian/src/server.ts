@@ -570,11 +570,22 @@ async function handleAcsRequest(
   // visible to the Inspector rather than invisible.
   const method = extractMethod(raw);
   envelopeLog.write("request", raw, method);
-  const stepSpan = traceExporter.start(raw, method, Buffer.byteLength(body.text));
+  // Validated once, here, before the span opens, because only a request the
+  // Guardian trusts gets a span: Trace Events forbids an acs.decision under
+  // the ids of a request rejected before it was trusted. The rejection stays
+  // visible in the envelope log above. dispatch acts on the same result
+  // rather than validating again. A signature, replay or timestamp check
+  // belongs beside this one when one lands, so a request it rejects is
+  // untrusted here too.
+  const validation = validateForDispatch(raw);
+  const stepSpan = traceExporter.start(raw, method, {
+    trusted: validation.kind === "valid",
+    payloadBytes: Buffer.byteLength(body.text),
+  });
 
   let response: JsonRpcSuccess | JsonRpcFailure;
   try {
-    response = await dispatch(raw, bridge, mapping, onDecisionFailure, sessionContextStore);
+    response = await dispatch(raw, validation, bridge, mapping, onDecisionFailure, sessionContextStore);
   } catch (error) {
     // The outer net. Deliberately a bare JSON-RPC error, not an ACS `deny`:
     // this route is `dispatch` rethrowing entirely past denyOnInvalidEnvelope
@@ -712,8 +723,29 @@ async function readCappedBody(req: Request): Promise<CappedBody> {
     : { withinLimit: true, text: text + decoder.decode() };
 }
 
+/**
+ * validateEnvelope's outcome, held rather than thrown so handleAcsRequest can
+ * read it before the trace span opens and dispatch can act on it after.
+ * `failed` is anything validateEnvelope threw that is not a validation
+ * verdict (a missing schema directory, say). dispatch rethrows it, so it
+ * still reaches the outer net exactly as it did when dispatch validated.
+ */
+type Validation =
+  | { kind: "valid"; envelope: AcsRequestEnvelope }
+  | { kind: "invalid"; error: EnvelopeValidationError }
+  | { kind: "failed"; error: unknown };
+
+function validateForDispatch(raw: unknown): Validation {
+  try {
+    return { kind: "valid", envelope: validateEnvelope(raw) };
+  } catch (error) {
+    return error instanceof EnvelopeValidationError ? { kind: "invalid", error } : { kind: "failed", error };
+  }
+}
+
 async function dispatch(
   raw: unknown,
+  validation: Validation,
   bridge: PolicyBridge<GuardianSnapshot>,
   mapping: Mapping,
   onDecisionFailure: "proceed" | "deny" | undefined,
@@ -721,31 +753,28 @@ async function dispatch(
 ): Promise<JsonRpcSuccess | JsonRpcFailure> {
   const rpcId = extractId(raw);
 
-  let envelope: AcsRequestEnvelope;
-  try {
-    // validateEnvelope checks the general request-envelope.json shape for
-    // every method, plus -- only for steps/toolCallRequest -- the
-    // hook-specific payload schema. Failure is a THROWN typed error, never
-    // a decision itself -- validateEnvelope stays total to its own contract
-    // (see its doc comment) -- but the catch below (denyOnInvalidEnvelope)
-    // turns a steps/* failure into an honoured ACS `deny` decision rather
-    // than a bare JSON-RPC error, since there is an identifiable step to
-    // answer for. A handshake failure and an undispatched method are not
-    // steps/*, so they always fall through to the JSON-RPC error unchanged.
-    envelope = validateEnvelope(raw);
-  } catch (error) {
-    if (error instanceof EnvelopeValidationError) {
-      if (isStepMethod(raw)) {
-        const denial = denyOnInvalidEnvelope(raw, { reasonCode: "envelope_invalid", message: error.message });
-        const decisionResponse = asDecisionResponse(rpcId, denial);
-        if (decisionResponse) {
-          return decisionResponse;
-        }
-      }
-      return errorResponse(rpcId, ENVELOPE_INVALID_CODE, error.message, { pointer: error.pointer });
-    }
-    throw error;
+  // validateEnvelope checked the general request-envelope.json shape for
+  // every method, plus -- only for steps/toolCallRequest -- the hook-specific
+  // payload schema (validateForDispatch, above). An invalid steps/* envelope
+  // becomes an honoured ACS `deny` decision rather than a bare JSON-RPC error,
+  // since there is an identifiable step to answer for. A handshake failure
+  // and an undispatched method are not steps/*, so they always fall through
+  // to the JSON-RPC error unchanged.
+  if (validation.kind === "failed") {
+    throw validation.error;
   }
+  if (validation.kind === "invalid") {
+    const { error } = validation;
+    if (isStepMethod(raw)) {
+      const denial = denyOnInvalidEnvelope(raw, { reasonCode: "envelope_invalid", message: error.message });
+      const decisionResponse = asDecisionResponse(rpcId, denial);
+      if (decisionResponse) {
+        return decisionResponse;
+      }
+    }
+    return errorResponse(rpcId, ENVELOPE_INVALID_CODE, error.message, { pointer: error.pointer });
+  }
+  const envelope = validation.envelope;
 
   if (envelope.method === HANDSHAKE_METHOD) {
     const env = onDecisionFailure === undefined ? undefined : { ACS_ON_DECISION_FAILURE: onDecisionFailure };

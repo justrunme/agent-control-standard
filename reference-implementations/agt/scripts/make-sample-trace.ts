@@ -42,8 +42,9 @@ export type Scenario = {
   capability?: string;
   /** The `request_id_ref` a result carried, if any. */
   requestIdRef?: string;
-  /** The decision the Guardian answered with, or none when it answered an
-   * error or was never reached. */
+  /** The decision the Guardian answered with, or none when it was never
+   * reached. A request it rejects before trusting it gets no span at all
+   * (Trace Events), so the sample has no such step. */
   decision?: "allow" | "deny";
 };
 
@@ -52,7 +53,6 @@ export const SCENARIOS: readonly Scenario[] = [
   { name: "allowed", requestId: "1b6f0c2a-3d4e-4f5a-8b6c-7d8e9f0a1b01", capability: "process.exec", decision: "allow" },
   { name: "result", requestId: "1b6f0c2a-3d4e-4f5a-8b6c-7d8e9f0a1b02", requestIdRef: "1b6f0c2a-3d4e-4f5a-8b6c-7d8e9f0a1b01", decision: "allow" },
   { name: "denied", requestId: "1b6f0c2a-3d4e-4f5a-8b6c-7d8e9f0a1b03", decision: "deny" },
-  { name: "error", requestId: "1b6f0c2a-3d4e-4f5a-8b6c-7d8e9f0a1b04" },
   { name: "late", requestId: "1b6f0c2a-3d4e-4f5a-8b6c-7d8e9f0a1b05", decision: "allow" },
   { name: "unreachable", requestId: "1b6f0c2a-3d4e-4f5a-8b6c-7d8e9f0a1b06" },
 ];
@@ -114,8 +114,6 @@ function requests(): Record<string, unknown>[] {
       },
       3,
     ),
-    // No JSON-RPC id: the Guardian answers with an error, not a decision.
-    envelope("steps/toolCallRequest", requestIdOf("error"), bash("pwd"), null),
     envelope("steps/toolCallRequest", requestIdOf("late"), bash(`echo ${SLOW_MARKER}`), 5),
   ];
 }

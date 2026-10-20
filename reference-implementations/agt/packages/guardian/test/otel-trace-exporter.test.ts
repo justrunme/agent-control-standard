@@ -25,6 +25,9 @@ import {
   type OtelTraceExporter,
 } from "../src/otel-trace-exporter.ts";
 
+/** What the Guardian tells `start` about a request it accepted. */
+const TRUSTED = { trusted: true } as const;
+
 /** The live mapping, read the same way the exporter reads it, so every
  * expected name below comes from the file and not from a literal that could
  * drift from it. */
@@ -114,7 +117,7 @@ describe("createOtelTraceExporter -- what one exchange becomes", () => {
     const requestId = crypto.randomUUID();
     const request = toolCallEnvelope("rm -rf /", { id: 7, requestId, sessionId });
 
-    const step = exporter.start(request, "steps/toolCallRequest");
+    const step = exporter.start(request, "steps/toolCallRequest", TRUSTED);
     exporter.end(step, decisionResponse(7, DENY));
     await exporter.flush();
 
@@ -132,7 +135,7 @@ describe("createOtelTraceExporter -- what one exchange becomes", () => {
 
   it("records the decision as the mapping's event on that span, with acs.decision and no evaluator the response did not send", async () => {
     const { exporter, spans } = memoryExporter();
-    exporter.end(exporter.start(toolCallEnvelope("rm -rf /", { id: 7 }), "steps/toolCallRequest"), decisionResponse(7, DENY));
+    exporter.end(exporter.start(toolCallEnvelope("rm -rf /", { id: 7 }), "steps/toolCallRequest", TRUSTED), decisionResponse(7, DENY));
     await exporter.flush();
 
     const [event] = spans()[0]?.events ?? [];
@@ -153,7 +156,7 @@ describe("createOtelTraceExporter -- what one exchange becomes", () => {
   it("takes acs.evaluator from the response when it carries one", async () => {
     const { exporter, spans } = memoryExporter();
     exporter.end(
-      exporter.start(toolCallEnvelope("ls", { id: 7 }), "steps/toolCallRequest"),
+      exporter.start(toolCallEnvelope("ls", { id: 7 }), "steps/toolCallRequest", TRUSTED),
       decisionResponse(7, { decision: "allow", metadata: { evaluator: "agent", model_id: "m-1" } }),
     );
     await exporter.flush();
@@ -166,7 +169,7 @@ describe("createOtelTraceExporter -- what one exchange becomes", () => {
   it("lines up policy columns in wire order, with \"\" where a reference lacks the field", async () => {
     const { exporter, spans } = memoryExporter();
     exporter.end(
-      exporter.start(toolCallEnvelope("ls", { id: 7 }), "steps/toolCallRequest"),
+      exporter.start(toolCallEnvelope("ls", { id: 7 }), "steps/toolCallRequest", TRUSTED),
       decisionResponse(7, {
         decision: "deny",
         reasoning: "x",
@@ -187,7 +190,7 @@ describe("createOtelTraceExporter -- what one exchange becomes", () => {
   it("pads a missing rule_id with \"\" in its own position", async () => {
     const { exporter, spans } = memoryExporter();
     exporter.end(
-      exporter.start(toolCallEnvelope("ls", { id: 7 }), "steps/toolCallRequest"),
+      exporter.start(toolCallEnvelope("ls", { id: 7 }), "steps/toolCallRequest", TRUSTED),
       decisionResponse(7, {
         decision: "deny",
         reasoning: "x",
@@ -210,7 +213,7 @@ describe("createOtelTraceExporter -- what one exchange becomes", () => {
   it("emits all three policy columns at the length of policy_references", async () => {
     const { exporter, spans } = memoryExporter();
     exporter.end(
-      exporter.start(toolCallEnvelope("ls", { id: 7 }), "steps/toolCallRequest"),
+      exporter.start(toolCallEnvelope("ls", { id: 7 }), "steps/toolCallRequest", TRUSTED),
       decisionResponse(7, {
         decision: "deny",
         reasoning: "x",
@@ -227,8 +230,8 @@ describe("createOtelTraceExporter -- what one exchange becomes", () => {
 
   it("carries acs.chain_hash only when the response does", async () => {
     const { exporter, spans } = memoryExporter();
-    exporter.end(exporter.start(toolCallEnvelope("ls", { id: 1 }), "steps/toolCallRequest"), decisionResponse(1, { decision: "allow", chain_hash: "a".repeat(64) }));
-    exporter.end(exporter.start(toolCallEnvelope("ls", { id: 2 }), "steps/toolCallRequest"), decisionResponse(2, { decision: "allow" }));
+    exporter.end(exporter.start(toolCallEnvelope("ls", { id: 1 }), "steps/toolCallRequest", TRUSTED), decisionResponse(1, { decision: "allow", chain_hash: "a".repeat(64) }));
+    exporter.end(exporter.start(toolCallEnvelope("ls", { id: 2 }), "steps/toolCallRequest", TRUSTED), decisionResponse(2, { decision: "allow" }));
     await exporter.flush();
 
     const [withHash, withoutHash] = spans();
@@ -240,8 +243,8 @@ describe("createOtelTraceExporter -- what one exchange becomes", () => {
     const { exporter, spans } = memoryExporter();
     // handshake/hello has no step_to_span entry. steps/sessionStart has one,
     // and is not in the ServerHello's methods_evaluated.
-    const hello = exporter.start(makeEnvelope("handshake/hello", {}, { id: 1 }), "handshake/hello");
-    const sessionStart = exporter.start(makeEnvelope("steps/sessionStart", {}, { id: 2 }), "steps/sessionStart");
+    const hello = exporter.start(makeEnvelope("handshake/hello", {}, { id: 1 }), "handshake/hello", TRUSTED);
+    const sessionStart = exporter.start(makeEnvelope("steps/sessionStart", {}, { id: 2 }), "steps/sessionStart", TRUSTED);
     expect(hello).toBeNull();
     expect(sessionStart).toBeNull();
     exporter.end(hello, { jsonrpc: "2.0", id: 1, result: { negotiated_version: "0.1.0" } });
@@ -257,7 +260,7 @@ describe("createOtelTraceExporter -- what one exchange becomes", () => {
   it("ends a span answered with a JSON-RPC error in error status, with a guardian_error failure event and no decision event", async () => {
     const { exporter, spans } = memoryExporter();
     exporter.end(
-      exporter.start(toolCallEnvelope("ls", { id: 9 }), "steps/toolCallRequest"),
+      exporter.start(toolCallEnvelope("ls", { id: 9 }), "steps/toolCallRequest", TRUSTED),
       { jsonrpc: "2.0", id: 9, error: { code: -32020, message: "evaluation failed" } },
     );
     await exporter.flush();
@@ -279,7 +282,7 @@ describe("createOtelTraceExporter -- what one exchange becomes", () => {
   // at all still gets its span, closed by its own response.
   it("pairs request and response by handle, so a request with no JSON-RPC id still gets its span", async () => {
     const { exporter, spans } = memoryExporter();
-    const step = exporter.start(toolCallEnvelope("ls", { id: null }), "steps/toolCallRequest");
+    const step = exporter.start(toolCallEnvelope("ls", { id: null }), "steps/toolCallRequest", TRUSTED);
     expect(step).not.toBeNull();
     exporter.end(step, { jsonrpc: "2.0", id: null, error: { code: -32010, message: "invalid" } });
     await exporter.flush();
@@ -298,10 +301,10 @@ describe("createOtelTraceExporter -- what one exchange becomes", () => {
       onError: (error) => errors.push(error),
     });
 
-    const step = exporter.start(toolCallEnvelope("ls", { id: 1 }), "steps/toolCallRequest");
+    const step = exporter.start(toolCallEnvelope("ls", { id: 1 }), "steps/toolCallRequest", TRUSTED);
     expect(() => exporter.end(step, decisionResponse(1, DENY))).not.toThrow();
     await exporter.flush();
-    expect(() => exporter.start(toolCallEnvelope("ls", { id: 2 }), "steps/toolCallRequest")).not.toThrow();
+    expect(() => exporter.start(toolCallEnvelope("ls", { id: 2 }), "steps/toolCallRequest", TRUSTED)).not.toThrow();
     await exporter.flush();
     await exporter.shutdown();
 
@@ -321,7 +324,7 @@ describe("createOtelTraceExporter -- what one exchange becomes", () => {
         methodsEvaluated: METHODS_EVALUATED,
         onError: (error) => errors.push(error),
       });
-      expect(exporter.start(toolCallEnvelope("ls", { id: 1 }), "steps/toolCallRequest")).toBeNull();
+      expect(exporter.start(toolCallEnvelope("ls", { id: 1 }), "steps/toolCallRequest", TRUSTED)).toBeNull();
       await exporter.shutdown();
       expect(errors).toHaveLength(1);
     } finally {
@@ -346,7 +349,7 @@ describe("createOtelTraceExporter -- what one exchange becomes", () => {
     });
     try {
       for (const id of [1, 2, 3]) {
-        exporter.end(exporter.start(toolCallEnvelope("ls", { id }), "steps/toolCallRequest"), decisionResponse(id, { decision: "allow" }));
+        exporter.end(exporter.start(toolCallEnvelope("ls", { id }), "steps/toolCallRequest", TRUSTED), decisionResponse(id, { decision: "allow" }));
         await exporter.flush();
       }
       await exporter.shutdown();
@@ -376,7 +379,7 @@ describe("createOtelTraceExporter -- what one exchange becomes", () => {
     });
     const exporter = createOtelTraceExporter({ endpoint: `http://127.0.0.1:${collector.port}/v1/traces`, methodsEvaluated: METHODS_EVALUATED });
     try {
-      exporter.end(exporter.start(toolCallEnvelope("ls", { id: 1 }), "steps/toolCallRequest"), decisionResponse(1, { decision: "allow" }));
+      exporter.end(exporter.start(toolCallEnvelope("ls", { id: 1 }), "steps/toolCallRequest", TRUSTED), decisionResponse(1, { decision: "allow" }));
       await exporter.flush();
       await exporter.shutdown();
 
@@ -403,7 +406,7 @@ describe("createOtelTraceExporter -- what one exchange becomes", () => {
       },
       { id: 1 },
     );
-    exporter.end(exporter.start(request, "steps/toolCallRequest"), decisionResponse(1, { decision: "allow" }));
+    exporter.end(exporter.start(request, "steps/toolCallRequest", TRUSTED), decisionResponse(1, { decision: "allow" }));
     await exporter.flush();
 
     const attributes = spans()[0]?.attributes;
@@ -424,7 +427,7 @@ describe("createOtelTraceExporter -- what one exchange becomes", () => {
       },
       { id: 1 },
     );
-    exporter.end(exporter.start(request, "steps/toolCallRequest"), decisionResponse(1, { decision: "allow" }));
+    exporter.end(exporter.start(request, "steps/toolCallRequest", TRUSTED), decisionResponse(1, { decision: "allow" }));
     await exporter.flush();
 
     const attributes = spans()[0]?.attributes;
@@ -434,7 +437,7 @@ describe("createOtelTraceExporter -- what one exchange becomes", () => {
 
   it("carries no provenance attribute when nothing in the payload has one", async () => {
     const { exporter, spans } = memoryExporter();
-    exporter.end(exporter.start(toolCallEnvelope("ls", { id: 1 }), "steps/toolCallRequest"), decisionResponse(1, { decision: "allow" }));
+    exporter.end(exporter.start(toolCallEnvelope("ls", { id: 1 }), "steps/toolCallRequest", TRUSTED), decisionResponse(1, { decision: "allow" }));
     await exporter.flush();
 
     const attributes = spans()[0]?.attributes ?? {};
@@ -452,7 +455,7 @@ describe("createOtelTraceExporter -- what one exchange becomes", () => {
       },
       { id: 1 },
     );
-    exporter.end(exporter.start(request, "steps/toolCallResult"), decisionResponse(1, { decision: "allow" }));
+    exporter.end(exporter.start(request, "steps/toolCallResult", TRUSTED), decisionResponse(1, { decision: "allow" }));
     await exporter.flush();
 
     const [span] = spans();
@@ -470,8 +473,8 @@ describe("createOtelTraceExporter -- what one exchange becomes", () => {
     const { exporter, spans } = memoryExporter();
     const first = crypto.randomUUID();
     const second = crypto.randomUUID();
-    exporter.end(exporter.start(toolCallEnvelope("ls", { id: 1, requestId: first }), "steps/toolCallRequest"), decisionResponse(1, { decision: "allow" }));
-    exporter.end(exporter.start(toolCallEnvelope("ls", { id: 2, requestId: second }), "steps/toolCallRequest"), decisionResponse(2, { decision: "allow" }));
+    exporter.end(exporter.start(toolCallEnvelope("ls", { id: 1, requestId: first }), "steps/toolCallRequest", TRUSTED), decisionResponse(1, { decision: "allow" }));
+    exporter.end(exporter.start(toolCallEnvelope("ls", { id: 2, requestId: second }), "steps/toolCallRequest", TRUSTED), decisionResponse(2, { decision: "allow" }));
     await exporter.flush();
     const [spanA, spanB] = spans();
     try {
@@ -501,7 +504,7 @@ describe("createOtelTraceExporter -- what one exchange becomes", () => {
     const path = join(nested, "traces.jsonl");
     const exporter = createOtelTraceExporter({ filePath: path, methodsEvaluated: METHODS_EVALUATED });
     try {
-      exporter.end(exporter.start(toolCallEnvelope("ls", { id: 1 }), "steps/toolCallRequest"), decisionResponse(1, { decision: "allow" }));
+      exporter.end(exporter.start(toolCallEnvelope("ls", { id: 1 }), "steps/toolCallRequest", TRUSTED), decisionResponse(1, { decision: "allow" }));
       await exporter.shutdown();
 
       expect((statSync(nested).mode & 0o777).toString(8)).toBe("700");
@@ -528,7 +531,7 @@ describe("createOtelTraceExporter -- what one exchange becomes", () => {
       },
     };
     const exporter = createOtelTraceExporter({ spanExporter: slow, methodsEvaluated: METHODS_EVALUATED });
-    exporter.end(exporter.start(toolCallEnvelope("ls", { id: 1 }), "steps/toolCallRequest"), decisionResponse(1, { decision: "allow" }));
+    exporter.end(exporter.start(toolCallEnvelope("ls", { id: 1 }), "steps/toolCallRequest", TRUSTED), decisionResponse(1, { decision: "allow" }));
 
     const first = exporter.shutdown();
     const second = exporter.shutdown();
@@ -571,7 +574,7 @@ describe("createOtelTraceExporter -- what one exchange becomes", () => {
     );
     try {
       const { exporter, spans } = memoryExporter({ mappingPath });
-      exporter.end(exporter.start(toolCallEnvelope("ls", { id: 1 }), "steps/toolCallRequest"), decisionResponse(1, { decision: "allow" }));
+      exporter.end(exporter.start(toolCallEnvelope("ls", { id: 1 }), "steps/toolCallRequest", TRUSTED), decisionResponse(1, { decision: "allow" }));
       await exporter.flush();
 
       const [span] = spans();
@@ -613,7 +616,7 @@ describe("createOtelTraceExporter -- what one exchange becomes", () => {
   });
 
   it("NULL_OTEL_TRACE_EXPORTER writes nothing and never throws", async () => {
-    expect(NULL_OTEL_TRACE_EXPORTER.start(toolCallEnvelope("ls"), "steps/toolCallRequest")).toBeNull();
+    expect(NULL_OTEL_TRACE_EXPORTER.start(toolCallEnvelope("ls"), "steps/toolCallRequest", TRUSTED)).toBeNull();
     expect(() => NULL_OTEL_TRACE_EXPORTER.end(null, decisionResponse(1, DENY))).not.toThrow();
     await NULL_OTEL_TRACE_EXPORTER.flush();
     await NULL_OTEL_TRACE_EXPORTER.shutdown();
@@ -742,24 +745,61 @@ describe("Guardian trace export wiring", () => {
     }
   });
 
-  // The span opens before validation, so the envelope that fails the schema
-  // is visible in the trace too -- as a deny, and with no chain hash, because
-  // the step never reached the chain.
-  it("gives a schema-invalid steps/* envelope a span with a deny event and no acs.chain_hash", async () => {
+  // Trace Events: a Guardian MUST NOT emit acs.decision, or acs.decision.failure,
+  // under the pair of a request it rejects before trusting it, because such a
+  // request can carry any pair, a genuine request's included. The mapping
+  // requires the pair on every step span, so a rejected request gets no span.
+  // The envelope log still records it.
+  it("gives a schema-invalid steps/* envelope no span, and still answers it with a deny", async () => {
     const { exporter, spans } = memoryExporter();
     const guardian = await startGuardian({ ...baseOptions, traceExporter: exporter });
     try {
       const bad = toolCallEnvelope("rm -rf /", { id: 12 });
       delete (bad.params as Record<string, unknown>).acs_version;
+      const answer = await postRaw(guardian.url, bad);
+      await exporter.flush();
+
+      // The host still gets its honoured deny. Only the trace changes.
+      expect((answer.result as { decision?: string } | undefined)?.decision).toBe("deny");
+      expect(spans()).toHaveLength(0);
+    } finally {
+      await guardian.close();
+    }
+  });
+
+  it("leaves a genuine request the only span under its pair when a rejected request forges that pair", async () => {
+    const { exporter, spans } = memoryExporter();
+    const guardian = await startGuardian({ ...baseOptions, traceExporter: exporter });
+    try {
+      const requestId = crypto.randomUUID();
+      const sessionId = crypto.randomUUID();
+      await postRaw(guardian.url, toolCallEnvelope("ls -la", { id: 1, requestId, sessionId }));
+      const forged = toolCallEnvelope("rm -rf /", { id: 2, requestId, sessionId });
+      delete (forged.params as Record<string, unknown>).acs_version;
+      await postRaw(guardian.url, forged);
+      await exporter.flush();
+
+      const underPair = spans().filter((span) => span.attributes["acs.request_id"] === requestId);
+      expect(spans()).toHaveLength(1);
+      expect(underPair).toHaveLength(1);
+      expect(underPair[0]?.events.map((event) => event.attributes?.["acs.decision"])).toEqual(["allow"]);
+    } finally {
+      await guardian.close();
+    }
+  });
+
+  it("emits no span and no decision failure for an invalid envelope answered with a bare error", async () => {
+    const { exporter, spans } = memoryExporter();
+    const guardian = await startGuardian({ ...baseOptions, traceExporter: exporter });
+    try {
+      // No request_id and no JSON-RPC id: denyOnInvalidEnvelope cannot address
+      // a decision, so the Guardian answers with a JSON-RPC error instead.
+      const bad = toolCallEnvelope("ls", { id: null });
+      delete (bad.params as Record<string, unknown>).request_id;
       await postRaw(guardian.url, bad);
       await exporter.flush();
 
-      const [span] = spans();
-      expect(spans()).toHaveLength(1);
-      const attributes = span?.events[0]?.attributes;
-      expect(attributes?.["acs.decision"]).toBe("deny");
-      expect(attributes?.["acs.reason_codes"]).toEqual(["envelope_invalid"]);
-      expect(attributes?.["acs.chain_hash"]).toBeUndefined();
+      expect(spans()).toHaveLength(0);
     } finally {
       await guardian.close();
     }
@@ -954,31 +994,38 @@ describe("Guardian trace export wiring", () => {
   }, 15_000);
 
   // server.ts builds the exporter from the ServerHello, so the posture on a
-  // failure event is the one this Guardian declared to the host. An envelope
-  // with neither an id nor a request_id earns a deny that cannot be
-  // addressed to it, so the Guardian answers a bare JSON-RPC error: a
-  // guardian_error on the span, through the file path that production uses.
+  // failure event is the one this Guardian declared to the host. The failure
+  // here is a decision that finished after the ServerHello's own timeout, on
+  // a request the Guardian trusted, through the file path production uses.
+  // An invalid envelope would not do: a request rejected before it is
+  // trusted gets no failure event at all (see the schema-invalid case above).
   it("reports the ServerHello's posture on a failure event: a Guardian declaring deny says fail_closed", async () => {
     const dir = mkdtempSync(join(tmpdir(), "acs-otel-posture-"));
     const path = join(dir, "traces.jsonl");
-    const guardian = await startGuardian({ ...baseOptions, onDecisionFailure: "deny", otelTraceFile: path });
+    const late: PolicyBridge<GuardianSnapshot> = {
+      async evaluate() {
+        await Bun.sleep(buildServerHello().timeout_config.default_ms + 200);
+        return { decision: "allow" };
+      },
+    };
+    const guardian = await startGuardian({ ...baseOptions, bridge: late, onDecisionFailure: "deny", otelTraceFile: path });
     try {
-      const response = await postRaw(guardian.url, { jsonrpc: "2.0", method: "steps/toolCallRequest", params: {} });
-      expect(response.error).toBeDefined();
+      const response = await postRaw(guardian.url, toolCallEnvelope("ls -la", { id: 1 }));
+      expect(response.result).toBeDefined();
     } finally {
       await guardian.close();
     }
     try {
       const [span] = otlpSpans(otlpFile(path));
       const failure = span?.events?.find((event) => event.name === "acs.decision.failure");
-      expect(otlpAttribute(failure, "acs.failure.class")).toBe("guardian_error");
+      expect(otlpAttribute(failure, "acs.failure.class")).toBe("timeout");
       expect(otlpAttribute(failure, "acs.failure.posture")).toBe("fail_closed");
       expect(otlpAttribute(failure, "acs.failure.reported_by")).toBe("guardian");
     } finally {
       unlinkSync(path);
       rmdirSync(dir);
     }
-  });
+  }, 15_000);
 
   // A collector that is down must cost the endpoint and nothing else. The
   // real OTLPTraceExporter against a closed port, not the throwing stub: a
@@ -1094,7 +1141,7 @@ describe("createOtelTraceExporter -- review fixes", () => {
   // to the same rule, since it lands in the same backend.
   it("copies no JSON-RPC error text into the failure event or the span status, and keeps the code", async () => {
     const { exporter, spans } = memoryExporter();
-    exporter.end(exporter.start(toolCallEnvelope("ls", { id: 3 }), "steps/toolCallRequest"), {
+    exporter.end(exporter.start(toolCallEnvelope("ls", { id: 3 }), "steps/toolCallRequest", TRUSTED), {
       jsonrpc: "2.0",
       id: 3,
       error: { code: -32020, message: `evaluation failed: ${SENTINEL}` },
@@ -1112,7 +1159,7 @@ describe("createOtelTraceExporter -- review fixes", () => {
   // as a replay, because that pair belongs to the earlier request.
   it("emits no failure event for REPLAY_DETECTED (-32005)", async () => {
     const { exporter, spans } = memoryExporter();
-    exporter.end(exporter.start(toolCallEnvelope("ls", { id: 4 }), "steps/toolCallRequest"), {
+    exporter.end(exporter.start(toolCallEnvelope("ls", { id: 4 }), "steps/toolCallRequest", TRUSTED), {
       jsonrpc: "2.0",
       id: 4,
       error: { code: -32005, message: "replay" },
@@ -1130,7 +1177,7 @@ describe("createOtelTraceExporter -- review fixes", () => {
       tool: { name: "run_shell" },
       arguments: { a: { value: "x", provenance: provenance("tool_output") }, b: { value: "y", provenance: provenance("user_input") } },
     });
-    exporter.end(exporter.start(envelope, "steps/toolCallRequest"), decisionResponse(1, DENY));
+    exporter.end(exporter.start(envelope, "steps/toolCallRequest", TRUSTED), decisionResponse(1, DENY));
     await exporter.flush();
 
     const attributes = spans()[0]?.attributes;
@@ -1153,7 +1200,7 @@ describe("createOtelTraceExporter -- review fixes", () => {
       { tool: { name: "run_shell" }, arguments: args },
       { sessionId: "x".repeat(10_000) },
     );
-    exporter.end(exporter.start(envelope, "steps/toolCallRequest"), decisionResponse(1, DENY));
+    exporter.end(exporter.start(envelope, "steps/toolCallRequest", TRUSTED), decisionResponse(1, DENY));
     await exporter.flush();
 
     expect(spans()).toHaveLength(1);
@@ -1171,7 +1218,7 @@ describe("createOtelTraceExporter -- review fixes", () => {
     process.env.OTEL_SPAN_EVENT_COUNT_LIMIT = "0";
     try {
       const { exporter, spans } = memoryExporter();
-      exporter.end(exporter.start(toolCallEnvelope("ls"), "steps/toolCallRequest"), decisionResponse(1, DENY));
+      exporter.end(exporter.start(toolCallEnvelope("ls"), "steps/toolCallRequest", TRUSTED), decisionResponse(1, DENY));
       await exporter.flush();
 
       expect(spans()).toHaveLength(1);
@@ -1199,7 +1246,7 @@ describe("createOtelTraceExporter -- review fixes", () => {
       exportTimeoutMs: 100,
       onError: (error) => errors.push(error),
     });
-    exporter.end(exporter.start(toolCallEnvelope("ls"), "steps/toolCallRequest"), decisionResponse(1, DENY));
+    exporter.end(exporter.start(toolCallEnvelope("ls"), "steps/toolCallRequest", TRUSTED), decisionResponse(1, DENY));
 
     const started = performance.now();
     await exporter.shutdown();
@@ -1228,7 +1275,7 @@ describe("createOtelTraceExporter -- review fixes", () => {
       for (const mappingPath of [undefined, path]) {
         const { exporter, spans } = memoryExporter({ mappingPath });
         exporter.end(
-          exporter.start(toolCallEnvelope("ls"), "steps/toolCallRequest"),
+          exporter.start(toolCallEnvelope("ls"), "steps/toolCallRequest", TRUSTED),
           decisionResponse(1, { ...DENY, reason_codes: ["blocked"], chain_hash: "a".repeat(64) }),
         );
         await exporter.flush();
@@ -1314,7 +1361,7 @@ describe("the Guardian's exporter does not depend on its environment", () => {
       // Three spans ended in one synchronous turn: with a queue of one, the
       // SDK's default-from-environment processor drops the ones that arrive
       // while the first export is in flight.
-      for (const id of [1, 2, 3]) exporter.end(exporter.start(envelope(id), "steps/toolCallRequest"), allow(id));
+      for (const id of [1, 2, 3]) exporter.end(exporter.start(envelope(id), "steps/toolCallRequest", TRUSTED), allow(id));
       await exporter.shutdown();
       const spans = readFileSync(path, "utf8")
         .split("\n")
@@ -1340,7 +1387,7 @@ describe("the Guardian's exporter does not depend on its environment", () => {
       const path = join(dir, "trace.jsonl");
       const exporter = createOtelTraceExporter({ filePath: path, methodsEvaluated: METHODS_EVALUATED });
       const request = envelope(1);
-      exporter.end(exporter.start(request, "steps/toolCallRequest"), allow(1));
+      exporter.end(exporter.start(request, "steps/toolCallRequest", TRUSTED), allow(1));
       await exporter.shutdown();
       const resourceSpans = JSON.parse(readFileSync(path, "utf8").split("\n")[0]!).resourceSpans[0];
       expect(resourceSpans.resource.attributes).toEqual([{ key: "service.name", value: { stringValue: OTEL_SERVICE_NAME } }]);
@@ -1357,7 +1404,7 @@ describe("the Guardian's exporter does not depend on its environment", () => {
     const collector = startCollector();
     try {
       const exporter = createOtelTraceExporter({ endpoint: collector.url, methodsEvaluated: METHODS_EVALUATED });
-      exporter.end(exporter.start(envelope(1), "steps/toolCallRequest"), allow(1));
+      exporter.end(exporter.start(envelope(1), "steps/toolCallRequest", TRUSTED), allow(1));
       await exporter.shutdown();
       expect(collector.received.map((r) => r.headers.get("content-encoding"))).toEqual([null]);
     } finally {
@@ -1373,7 +1420,7 @@ describe("the Guardian's exporter does not depend on its environment", () => {
     const collector = startCollector();
     try {
       const exporter = createOtelTraceExporter({ endpoint: collector.url, methodsEvaluated: METHODS_EVALUATED });
-      exporter.end(exporter.start(envelope(1), "steps/toolCallRequest"), allow(1));
+      exporter.end(exporter.start(envelope(1), "steps/toolCallRequest", TRUSTED), allow(1));
       await exporter.shutdown();
       expect(collector.received.map((r) => r.headers.get("x-acs-probe"))).toEqual(["1"]);
     } finally {
@@ -1415,7 +1462,7 @@ describe("the Guardian's exporter does not depend on its environment", () => {
         const endpoint = "http://127.0.0.1:" + collector.port + "/v1/traces";
         keepLoopbackOffProxy(endpoint, process.env);
         const exporter = createOtelTraceExporter({ endpoint, methodsEvaluated: ["steps/toolCallRequest"], onError: () => {} });
-        exporter.end(exporter.start(${JSON.stringify(envelope(1))}, "steps/toolCallRequest"), ${JSON.stringify(allow(1))});
+        exporter.end(exporter.start(${JSON.stringify(envelope(1))}, "steps/toolCallRequest", { trusted: true }), ${JSON.stringify(allow(1))});
         await exporter.shutdown();
         console.log(JSON.stringify({ collected }));
         collector.stop(true);

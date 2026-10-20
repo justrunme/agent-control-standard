@@ -151,13 +151,26 @@ export type StepSpan = {
   readonly payloadBytes?: number;
 };
 
+/**
+ * What `start` is told about the request besides its envelope. `trusted` is
+ * whether the Guardian accepted the envelope before acting on it, and an
+ * untrusted request gets no span. Such a request can carry any session and
+ * request id, a genuine request's included, and Trace Events forbids an
+ * acs.decision or acs.decision.failure under that pair. The mapping makes
+ * the pair required on every step span, so leaving it off is not an option
+ * either. `trusted` is required, not defaulted, so a caller that forgets it
+ * fails to compile rather than exporting an untrusted request's ids.
+ */
+export type StepStart = { trusted: boolean; payloadBytes?: number };
+
 /** The Guardian-side writer role, called at the envelope log's own two
  * points: `start` where the request is recorded, `end` where the response
  * is, with the handle `start` returned. */
 export type OtelTraceExporter = {
   /** Null when this request produces no span, and `end` then does nothing.
-   * `payloadBytes` is the request body's size, for the failure event. */
-  start(envelope: unknown, method: string | null, payloadBytes?: number): StepSpan | null;
+   * `payloadBytes` is the request body's size, for the failure event. An
+   * untrusted request produces no span (see StepStart). */
+  start(envelope: unknown, method: string | null, step: StepStart): StepSpan | null;
   end(stepSpan: StepSpan | null, response: unknown): void;
   /** Pushes every ended span through to the exporters now rather than on
    * the batch timer. Tests call it; shutdown does too. */
@@ -407,8 +420,8 @@ export function createOtelTraceExporter({
     });
   }
 
-  function begin(envelope: unknown, method: string | null, payloadBytes: number | undefined, tracer: Tracer, mapping: OtelMapping): StepSpan | null {
-    if (method === null || !handled.has(method)) {
+  function begin(envelope: unknown, method: string | null, { trusted, payloadBytes }: StepStart, tracer: Tracer, mapping: OtelMapping): StepSpan | null {
+    if (!trusted || method === null || !handled.has(method)) {
       return null;
     }
     const entry = mapping.stepToSpan[method];
@@ -484,12 +497,12 @@ export function createOtelTraceExporter({
   let shutdownPromise: Promise<void> | undefined;
 
   return {
-    start(envelope, method, payloadBytes): StepSpan | null {
+    start(envelope, method, step): StepSpan | null {
       if (disabled || stopped || tracer === undefined || mapping === undefined) {
         return null;
       }
       try {
-        return begin(envelope, method, payloadBytes, tracer, mapping);
+        return begin(envelope, method, step, tracer, mapping);
       } catch (error) {
         fail(error);
         return null;

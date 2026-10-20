@@ -116,7 +116,7 @@ It prints how many spans reached the file and exits non-zero when that is fewer 
 
 ### Sample trace
 
-[`samples/trace/acs-trace-sample.jsonl`](../../samples/trace/acs-trace-sample.jsonl) is what this export looks like, so you can read it without running the Guardian. It holds six steps: an allowed tool call and its result, linked by `acs.request_id_ref`, a denied call carrying reasoning, reason codes, policy references and provenance, a call the Guardian answered with an error, a decision that finished after the timeout, and a step the host could not deliver, converted from its audit log. The decisions come from the stock policy, and the one late decision is delayed on purpose. Every value in it is synthetic.
+[`samples/trace/acs-trace-sample.jsonl`](../../samples/trace/acs-trace-sample.jsonl) is what this export looks like, so you can read it without running the Guardian. It holds five steps: an allowed tool call and its result, linked by `acs.request_id_ref`, a denied call carrying reasoning, reason codes, policy references and provenance, a decision that finished after the timeout, and a step the host could not deliver, converted from its audit log. A request the Guardian rejects before trusting it, an envelope that fails validation for example, gets no span, because it can carry any session and request id and Trace Events forbids recording a decision under that pair. The envelope log still records it. The decisions come from the stock policy, and the one late decision is delayed on purpose. Every value in it is synthetic.
 
 ```bash
 bun run sample:trace

@@ -182,7 +182,7 @@ describe("the committed sample trace matches the mapping", () => {
     expect(denied["acs.provenance.source_id"]).toContain("");
   });
 
-  it("uses only failure classes, postures and reporters the mapping lists, and covers the four failures", () => {
+  it("uses only failure classes, postures and reporters the mapping lists, and covers the failures it holds", () => {
     const allowed = MAPPING.properties.decision_failure_event.properties.attribute_values.default;
     const seen = new Set<string>();
     for (const span of SPANS) {
@@ -197,7 +197,9 @@ describe("the committed sample trace matches the mapping", () => {
       }
       seen.add(`${failure["acs.failure.class"]}/${failure["acs.failure.reported_by"]}`);
     }
-    expect([...seen].sort()).toEqual(["guardian_error/guardian", "timeout/guardian", "unreachable/observed_agent"]);
+    // No guardian_error: this Guardian answers a request it trusts with a
+    // decision, and a request it rejects before trusting it gets no span.
+    expect([...seen].sort()).toEqual(["timeout/guardian", "unreachable/observed_agent"]);
   });
 });
 
