@@ -66,13 +66,20 @@ import {
   PROVENANCE_ATTRIBUTE_SOURCES,
   provenanceColumn,
   provenanceObjects,
-  REPLAY_DETECTED_CODE,
+  PRE_TRUST_REJECTION_CODES,
+  REJECTED_CLAIMED_REQUEST_ID,
+  REJECTED_CLAIMED_SESSION_ID,
+  REJECTED_ERROR_CODE,
+  REJECTED_REASON,
+  REJECTED_SPAN_NAME,
+  REJECTED_STATUS,
   requestParts,
   resultParts,
   STEP_ATTRIBUTE_SOURCES,
   type DecisionFailure,
   type FailureClass,
   type OtelMapping,
+  type RejectionReason,
 } from "./otel-mapping.ts";
 import { createFileSpanExporter } from "./otlp-file-exporter.ts";
 
@@ -86,8 +93,10 @@ export {
   GUARDIAN_ERROR_STATUS,
   loadOtelMapping,
   METHODS_WITHOUT_SPAN,
+  REJECTED_SPAN_NAME,
   STEP_ATTRIBUTE_SOURCES,
   type DecisionFailure,
+  type RejectionReason,
   type FailureClass,
   type FailurePosture,
   type FailureReporter,
@@ -149,19 +158,34 @@ export type StepSpan = {
   readonly method: string;
   readonly startedAt: number;
   readonly payloadBytes?: number;
+  /** The session and request id the request claimed. They go onto the span
+   * as acs.session.id and acs.request_id only when it ends as a trusted step
+   * (see `finish`), and under the rejected names otherwise. */
+  readonly claimed: Attributes;
+  /** Set when the request was rejected before its span opened. */
+  readonly rejected?: RejectionReason;
 };
 
 /**
  * What `start` is told about the request besides its envelope. `trusted` is
- * whether the Guardian accepted the envelope before acting on it, and an
- * untrusted request gets no span. Such a request can carry any session and
- * request id, a genuine request's included, and Trace Events forbids an
- * acs.decision or acs.decision.failure under that pair. The mapping makes
- * the pair required on every step span, so leaving it off is not an option
- * either. `trusted` is required, not defaulted, so a caller that forgets it
- * fails to compile rather than exporting an untrusted request's ids.
+ * whether the Guardian accepted the envelope before acting on it. A request
+ * it did not accept is recorded as a rejected request, apart from the steps
+ * it governed, with `reason` saying why (see REJECTED_SPAN_NAME). `trusted`
+ * is required, not defaulted, so a caller that forgets it fails to compile
+ * rather than exporting an untrusted request's ids as a step.
+ *
+ * Trusted here means accepted by every check this Guardian runs. This
+ * reference Guardian checks the envelope against the schema and nothing
+ * else: it verifies no signature, replay or timestamp yet (PR #229), so a
+ * forgery or a replay that passes the schema is still recorded as a step.
+ *
+ * `receivedAt` is `performance.now()` when the request arrived, so the time
+ * the Guardian spent checking it counts toward a late decision.
  */
-export type StepStart = { trusted: boolean; payloadBytes?: number };
+export type StepStart = { payloadBytes?: number; receivedAt?: number } & (
+  | { trusted: true }
+  | { trusted: false; reason: RejectionReason }
+);
 
 /** The Guardian-side writer role, called at the envelope log's own two
  * points: `start` where the request is recorded, `end` where the response
@@ -169,7 +193,7 @@ export type StepStart = { trusted: boolean; payloadBytes?: number };
 export type OtelTraceExporter = {
   /** Null when this request produces no span, and `end` then does nothing.
    * `payloadBytes` is the request body's size, for the failure event. An
-   * untrusted request produces no span (see StepStart). */
+   * untrusted request produces a rejected-request span (see StepStart). */
   start(envelope: unknown, method: string | null, step: StepStart): StepSpan | null;
   end(stepSpan: StepSpan | null, response: unknown): void;
   /** Pushes every ended span through to the exporters now rather than on
@@ -290,6 +314,22 @@ function isolated({ label, exporter }: Output, report: (label: string, error: un
       }
     },
   };
+}
+
+/** A rejected request's attributes: the ids it claimed, under names a reader
+ * cannot mistake for the ACS pair, and why it was rejected. */
+function rejectedAttributes(claimed: Attributes, reason: RejectionReason, errorCode?: number): Attributes {
+  const attributes: Attributes = { [REJECTED_REASON]: reason };
+  if (claimed["acs.session.id"] !== undefined) {
+    attributes[REJECTED_CLAIMED_SESSION_ID] = claimed["acs.session.id"];
+  }
+  if (claimed["acs.request_id"] !== undefined) {
+    attributes[REJECTED_CLAIMED_REQUEST_ID] = claimed["acs.request_id"];
+  }
+  if (errorCode !== undefined) {
+    attributes[REJECTED_ERROR_CODE] = errorCode;
+  }
+  return attributes;
 }
 
 export function createOtelTraceExporter({
@@ -420,8 +460,8 @@ export function createOtelTraceExporter({
     });
   }
 
-  function begin(envelope: unknown, method: string | null, { trusted, payloadBytes }: StepStart, tracer: Tracer, mapping: OtelMapping): StepSpan | null {
-    if (!trusted || method === null || !handled.has(method)) {
+  function begin(envelope: unknown, method: string | null, step: StepStart, tracer: Tracer, mapping: OtelMapping): StepSpan | null {
+    if (method === null || !handled.has(method)) {
       return null;
     }
     const entry = mapping.stepToSpan[method];
@@ -429,8 +469,25 @@ export function createOtelTraceExporter({
       return null;
     }
     const parts = requestParts(envelope);
+    // Held back, not set: the pair goes on only when the span ends as a
+    // trusted step, because a check that runs after this point can still
+    // reject the request (see PRE_TRUST_REJECTION_CODES).
+    const claimed: Attributes = {};
+    collect(claimed, Object.keys(CORRELATION_ATTRIBUTE_SOURCES), CORRELATION_ATTRIBUTE_SOURCES, parts);
+    const startedAt = step.receivedAt ?? performance.now();
+    if (!step.trusted) {
+      const rejected: StepSpan = {
+        span: tracer.startSpan(REJECTED_SPAN_NAME, { attributes: rejectedAttributes(claimed, step.reason), root: true }),
+        method,
+        startedAt,
+        payloadBytes: step.payloadBytes,
+        claimed,
+        rejected: step.reason,
+      };
+      openSpans.add(rejected);
+      return rejected;
+    }
     const attributes: Attributes = {};
-    collect(attributes, Object.keys(CORRELATION_ATTRIBUTE_SOURCES), CORRELATION_ATTRIBUTE_SOURCES, parts);
     collect(
       attributes,
       [...entry.required_attributes, ...(entry.conditional_attributes ?? []), ...(entry.optional_attributes ?? [])],
@@ -452,15 +509,40 @@ export function createOtelTraceExporter({
     const stepSpan: StepSpan = {
       span: tracer.startSpan(entry.span_name, { attributes, root: true }),
       method,
-      startedAt: performance.now(),
-      payloadBytes,
+      startedAt,
+      payloadBytes: step.payloadBytes,
+      claimed,
     };
     openSpans.add(stepSpan);
     return stepSpan;
   }
 
+  /** Ends a span as a rejected request: renamed if it opened as a step, the
+   * claimed ids under the rejected names, no ACS pair and no event. */
+  function finishRejected(stepSpan: StepSpan, reason: RejectionReason, errorCode?: number): void {
+    const { span } = stepSpan;
+    span.updateName(REJECTED_SPAN_NAME);
+    span.setAttributes(rejectedAttributes(stepSpan.claimed, reason, errorCode));
+    span.setStatus({ code: SpanStatusCode.ERROR, message: REJECTED_STATUS });
+    span.end();
+  }
+
   function finish(stepSpan: StepSpan, envelope: unknown, mapping: OtelMapping): void {
     const { span } = stepSpan;
+    const error = asObject(asObject(envelope)?.error);
+    const errorCode = asNumber(error?.code);
+    if (stepSpan.rejected !== undefined) {
+      finishRejected(stepSpan, stepSpan.rejected, errorCode);
+      return;
+    }
+    // A check that ran after the span opened rejected the request: it ends
+    // as a rejected request too, and the claimed pair never reaches it.
+    const lateRejection = errorCode === undefined ? undefined : PRE_TRUST_REJECTION_CODES.get(errorCode);
+    if (lateRejection !== undefined) {
+      finishRejected(stepSpan, lateRejection, errorCode);
+      return;
+    }
+    span.setAttributes(stepSpan.claimed);
     const decision = resultParts(envelope);
     if (decision === undefined) {
       // A JSON-RPC error: the step was answered but not decided. The first
@@ -468,12 +550,8 @@ export function createOtelTraceExporter({
       // carried: the message can quote the request (a schema error names its
       // argument keys), and #228 forbids copying response or error bytes into
       // the trace, so the status message is a fixed sentence too.
-      const error = asObject(asObject(envelope)?.error);
-      const errorCode = asNumber(error?.code);
       span.setStatus({ code: SpanStatusCode.ERROR, message: GUARDIAN_ERROR_STATUS });
-      if (errorCode !== REPLAY_DETECTED_CODE) {
-        span.addEvent(DECISION_FAILURE_EVENT, failureAttributes(stepSpan, "guardian_error", { errorCode }));
-      }
+      span.addEvent(DECISION_FAILURE_EVENT, failureAttributes(stepSpan, "guardian_error", { errorCode }));
     } else {
       const attributes: Attributes = {};
       collect(attributes, new Set([...mapping.decisionAttributes, ...DECISION_DETAIL_NAMES]), DECISION_ATTRIBUTE_SOURCES, decision);
@@ -545,6 +623,11 @@ export function createOtelTraceExporter({
         // so the step is exported at all.
         for (const stepSpan of openSpans) {
           try {
+            if (stepSpan.rejected !== undefined) {
+              finishRejected(stepSpan, stepSpan.rejected);
+              continue;
+            }
+            stepSpan.span.setAttributes(stepSpan.claimed);
             stepSpan.span.addEvent(
               DECISION_FAILURE_EVENT,
               failureAttributes(stepSpan, "other", { detail: "the Guardian shut down before it answered this step" }),

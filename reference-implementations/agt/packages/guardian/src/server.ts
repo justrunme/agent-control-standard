@@ -568,20 +568,25 @@ async function handleAcsRequest(
 
   // Recorded before validation, so an envelope that fails the schema is
   // visible to the Inspector rather than invisible.
+  const receivedAt = performance.now();
   const method = extractMethod(raw);
   envelopeLog.write("request", raw, method);
-  // Validated once, here, before the span opens, because only a request the
-  // Guardian trusts gets a span: Trace Events forbids an acs.decision under
-  // the ids of a request rejected before it was trusted. The rejection stays
-  // visible in the envelope log above. dispatch acts on the same result
-  // rather than validating again. A signature, replay or timestamp check
-  // belongs beside this one when one lands, so a request it rejects is
-  // untrusted here too.
+  // Validated once, here, before the span opens, because the span has to
+  // know whether the Guardian trusts this request: Trace Events forbids an
+  // acs.decision under the ids of a request rejected before it was trusted.
+  // A rejected request is recorded apart, as a rejected-request span (issue
+  // #283). dispatch acts on the same result rather than validating again. A
+  // signature, replay or timestamp rejection answered from inside dispatch
+  // is caught by its error code when the span ends (PRE_TRUST_REJECTION_CODES).
   const validation = validateForDispatch(raw);
-  const stepSpan = traceExporter.start(raw, method, {
-    trusted: validation.kind === "valid",
-    payloadBytes: Buffer.byteLength(body.text),
-  });
+  const payloadBytes = Buffer.byteLength(body.text);
+  const stepSpan = traceExporter.start(
+    raw,
+    method,
+    validation.kind === "valid"
+      ? { trusted: true, payloadBytes, receivedAt }
+      : { trusted: false, reason: validation.kind === "invalid" ? "envelope_invalid" : "guardian_fault", payloadBytes, receivedAt },
+  );
 
   let response: JsonRpcSuccess | JsonRpcFailure;
   try {

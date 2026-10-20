@@ -24,25 +24,13 @@ The span carries the join pair (`acs.session.id` and `acs.request_id`), the tool
 
 ```json
 {
-  "traceId": "85c4878c9bda9e5b4f2fc6aae242d31f",
-  "spanId": "dea6530ad1681c0e",
+  "traceId": "d327f235c726545b0c17f6401efd98d1",
+  "spanId": "ec45435f512ec8ab",
   "name": "gen_ai.tool.call",
   "kind": 1,
-  "startTimeUnixNano": "1791928279698000000",
-  "endTimeUnixNano": "1791928279749301083",
+  "startTimeUnixNano": "1792533584275000000",
+  "endTimeUnixNano": "1792533584341659625",
   "attributes": [
-    {
-      "key": "acs.session.id",
-      "value": {
-        "stringValue": "5a3c1e7e-0b1d-4c6a-9e2f-7d4b8c0a1f01"
-      }
-    },
-    {
-      "key": "acs.request_id",
-      "value": {
-        "stringValue": "1b6f0c2a-3d4e-4f5a-8b6c-7d8e9f0a1b03"
-      }
-    },
     {
       "key": "gen_ai.tool.name",
       "value": {
@@ -77,6 +65,18 @@ The span carries the join pair (`acs.session.id` and `acs.request_id`), the tool
             }
           ]
         }
+      }
+    },
+    {
+      "key": "acs.session.id",
+      "value": {
+        "stringValue": "5a3c1e7e-0b1d-4c6a-9e2f-7d4b8c0a1f01"
+      }
+    },
+    {
+      "key": "acs.request_id",
+      "value": {
+        "stringValue": "1b6f0c2a-3d4e-4f5a-8b6c-7d8e9f0a1b03"
       }
     }
   ],
@@ -146,7 +146,7 @@ The span carries the join pair (`acs.session.id` and `acs.request_id`), the tool
         }
       ],
       "name": "acs.decision",
-      "timeUnixNano": "1791928279749295500",
+      "timeUnixNano": "1792533584341654208",
       "droppedAttributesCount": 0
     }
   ],
@@ -168,7 +168,7 @@ The span above is real output from the reference Guardian. This section explains
 
 ### Two streams, joined by a reader
 
-No single process sees every outcome of a step. The Guardian sees each request it receives and the answer it gives. It exports one span per decided step, with the `acs.decision` event on it. It also reports the failures it can see itself: an error it returned instead of a decision, a decision it finished after the negotiated timeout, and a step still open when it shut down.
+No single process sees every outcome of a step. The Guardian sees each request it receives and the answer it gives. It exports one span per step it trusted, with the `acs.decision` event on it, and records a request it rejected before trusting it apart, under names other than `acs.session.id` and `acs.request_id`. It also reports the failures it can see itself: an error it returned instead of a decision, a decision it finished after the negotiated timeout, and a step still open when it shut down.
 
 The host sees what the Guardian can't. An unreachable Guardian has nothing to record. A Guardian whose answer arrives after the host stopped waiting can't see what the host did in the meantime. The host adapter records both cases in its own audit log. A converter, `audit-to-otlp.ts`, turns that log into spans of the same OTLP/JSON shape, each with an `acs.decision.failure` event whose `acs.failure.reported_by` is `observed_agent`.
 
@@ -238,7 +238,7 @@ The collector path, set with `ACS_OTEL_ENDPOINT`, sends the same spans over OTLP
 
 The two Guardian outputs fail independently. The first failed write or send disables that output for the rest of the process and prints one line on stderr. The other output keeps running, and the decision goes out unchanged, as the [failure isolation](#failure-isolation) rule below requires. The [Guardian README](https://github.com/GenAI-Security-Project/agent-control-standard/blob/main/reference-implementations/agt/packages/guardian/README.md#troubleshooting) lists the messages you may see.
 
-The committed [sample trace](https://github.com/GenAI-Security-Project/agent-control-standard/blob/main/reference-implementations/agt/samples/trace/acs-trace-sample.jsonl) holds both streams in one file: four spans from the Guardian and one from the converter. Every value in it is synthetic.
+The committed [sample trace](https://github.com/GenAI-Security-Project/agent-control-standard/blob/main/reference-implementations/agt/samples/trace/acs-trace-sample.jsonl) holds both streams in one file: five spans from the Guardian, one of them a rejected request, and one from the converter. Every value in it is synthetic.
 
 ### What the labels don't prove
 

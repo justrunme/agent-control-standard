@@ -20,6 +20,7 @@ import {
   METHODS_WITHOUT_SPAN,
   NULL_OTEL_TRACE_EXPORTER,
   OTEL_SERVICE_NAME,
+  REJECTED_SPAN_NAME,
   STEP_ATTRIBUTE_SOURCES,
   type CreateOtelTraceExporterOptions,
   type OtelTraceExporter,
@@ -279,15 +280,20 @@ describe("createOtelTraceExporter -- what one exchange becomes", () => {
   });
 
   // The pairing is the handle, not the id: an envelope with no JSON-RPC id
-  // at all still gets its span, closed by its own response.
+  // at all still gets its span, closed by its own response. The schema
+  // requires an id, so such an envelope is always one the Guardian rejected.
   it("pairs request and response by handle, so a request with no JSON-RPC id still gets its span", async () => {
     const { exporter, spans } = memoryExporter();
-    const step = exporter.start(toolCallEnvelope("ls", { id: null }), "steps/toolCallRequest", TRUSTED);
+    const step = exporter.start(toolCallEnvelope("ls", { id: null }), "steps/toolCallRequest", {
+      trusted: false,
+      reason: "envelope_invalid",
+    });
     expect(step).not.toBeNull();
     exporter.end(step, { jsonrpc: "2.0", id: null, error: { code: -32010, message: "invalid" } });
     await exporter.flush();
 
     expect(spans()).toHaveLength(1);
+    expect(spans()[0]?.name).toBe(REJECTED_SPAN_NAME);
     expect(spans()[0]?.status.code).toBe(SpanStatusCode.ERROR);
   });
 
@@ -745,12 +751,12 @@ describe("Guardian trace export wiring", () => {
     }
   });
 
-  // Trace Events: a Guardian MUST NOT emit acs.decision, or acs.decision.failure,
-  // under the pair of a request it rejects before trusting it, because such a
-  // request can carry any pair, a genuine request's included. The mapping
-  // requires the pair on every step span, so a rejected request gets no span.
-  // The envelope log still records it.
-  it("gives a schema-invalid steps/* envelope no span, and still answers it with a deny", async () => {
+  // Trace Events (PR #273): a Guardian MUST NOT emit acs.decision, or
+  // acs.decision.failure, under the pair of a request it rejects before
+  // trusting it, because such a request can carry any pair, a genuine
+  // request's included. Issue #283 ruled that it is still recorded, apart,
+  // under names outside step_to_span, so the attack stays visible.
+  it("records a schema-invalid steps/* envelope as a rejected request, and still answers it with a deny", async () => {
     const { exporter, spans } = memoryExporter();
     const guardian = await startGuardian({ ...baseOptions, traceExporter: exporter });
     try {
@@ -761,34 +767,50 @@ describe("Guardian trace export wiring", () => {
 
       // The host still gets its honoured deny. Only the trace changes.
       expect((answer.result as { decision?: string } | undefined)?.decision).toBe("deny");
-      expect(spans()).toHaveLength(0);
-    } finally {
-      await guardian.close();
-    }
-  });
-
-  it("leaves a genuine request the only span under its pair when a rejected request forges that pair", async () => {
-    const { exporter, spans } = memoryExporter();
-    const guardian = await startGuardian({ ...baseOptions, traceExporter: exporter });
-    try {
-      const requestId = crypto.randomUUID();
-      const sessionId = crypto.randomUUID();
-      await postRaw(guardian.url, toolCallEnvelope("ls -la", { id: 1, requestId, sessionId }));
-      const forged = toolCallEnvelope("rm -rf /", { id: 2, requestId, sessionId });
-      delete (forged.params as Record<string, unknown>).acs_version;
-      await postRaw(guardian.url, forged);
-      await exporter.flush();
-
-      const underPair = spans().filter((span) => span.attributes["acs.request_id"] === requestId);
+      const [span] = spans();
       expect(spans()).toHaveLength(1);
-      expect(underPair).toHaveLength(1);
-      expect(underPair[0]?.events.map((event) => event.attributes?.["acs.decision"])).toEqual(["allow"]);
+      expect(span?.name).toBe(REJECTED_SPAN_NAME);
+      expect(span?.attributes["acs.session.id"]).toBeUndefined();
+      expect(span?.attributes["acs.request_id"]).toBeUndefined();
+      expect(span?.attributes["guardian.rejected.reason"]).toBe("envelope_invalid");
+      expect(span?.events).toEqual([]);
     } finally {
       await guardian.close();
     }
   });
 
-  it("emits no span and no decision failure for an invalid envelope answered with a bare error", async () => {
+  // The forgery here fails the schema. One that passes it is still recorded
+  // as a step: this Guardian verifies no signature, replay or timestamp yet.
+  for (const order of ["genuine first", "forgery first"] as const) {
+    it(`keeps a genuine request the only span under its pair when a schema-invalid request forges it (${order})`, async () => {
+      const { exporter, spans } = memoryExporter();
+      const guardian = await startGuardian({ ...baseOptions, traceExporter: exporter });
+      try {
+        const requestId = crypto.randomUUID();
+        const sessionId = crypto.randomUUID();
+        const genuine = toolCallEnvelope("ls -la", { id: 1, requestId, sessionId });
+        const forged = toolCallEnvelope("rm -rf /", { id: 2, requestId, sessionId });
+        delete (forged.params as Record<string, unknown>).acs_version;
+        for (const envelope of order === "genuine first" ? [genuine, forged] : [forged, genuine]) {
+          await postRaw(guardian.url, envelope);
+        }
+        await exporter.flush();
+
+        const underPair = spans().filter(
+          (span) => span.attributes["acs.request_id"] === requestId && span.attributes["acs.session.id"] === sessionId,
+        );
+        expect(underPair).toHaveLength(1);
+        expect(underPair[0]?.events.map((event) => event.attributes?.["acs.decision"])).toEqual(["allow"]);
+        const rejected = spans().filter((span) => span.name === REJECTED_SPAN_NAME);
+        expect(rejected).toHaveLength(1);
+        expect(rejected[0]?.attributes["guardian.rejected.claimed_request_id"]).toBe(requestId);
+      } finally {
+        await guardian.close();
+      }
+    });
+  }
+
+  it("records an invalid envelope answered with a bare error as a rejected request, with no decision failure", async () => {
     const { exporter, spans } = memoryExporter();
     const guardian = await startGuardian({ ...baseOptions, traceExporter: exporter });
     try {
@@ -799,7 +821,10 @@ describe("Guardian trace export wiring", () => {
       await postRaw(guardian.url, bad);
       await exporter.flush();
 
-      expect(spans()).toHaveLength(0);
+      const [span] = spans();
+      expect(span?.name).toBe(REJECTED_SPAN_NAME);
+      expect(span?.events).toEqual([]);
+      expect(span?.attributes["guardian.rejected.error_code"]).toBe(-32010);
     } finally {
       await guardian.close();
     }
@@ -1155,18 +1180,68 @@ describe("createOtelTraceExporter -- review fixes", () => {
     expect(span?.events[0]?.attributes?.["acs.failure.detail"]).toBeUndefined();
   });
 
-  // #228: a Guardian MUST NOT emit the failure event for a request it rejects
-  // as a replay, because that pair belongs to the earlier request.
-  it("emits no failure event for REPLAY_DETECTED (-32005)", async () => {
-    const { exporter, spans } = memoryExporter();
-    exporter.end(exporter.start(toolCallEnvelope("ls", { id: 4 }), "steps/toolCallRequest", TRUSTED), {
-      jsonrpc: "2.0",
-      id: 4,
-      error: { code: -32005, message: "replay" },
+  // #228 and PR #273: a request rejected before it was trusted gets no
+  // acs.decision.failure under its pair, because the pair may be a genuine
+  // request's. That holds even when the check ran after the span opened, as
+  // a signature, replay or timestamp check inside dispatch would: the span
+  // ends as a rejected request, renamed and without the pair.
+  for (const [code, reason] of [
+    [-32004, "signature_invalid"],
+    [-32005, "replay_detected"],
+    [-32006, "timestamp_out_of_window"],
+  ] as const) {
+    it(`records a step answered with ${code} as a rejected request, without its pair`, async () => {
+      const { exporter, spans } = memoryExporter();
+      const requestId = crypto.randomUUID();
+      exporter.end(exporter.start(toolCallEnvelope("ls", { id: 4, requestId }), "steps/toolCallRequest", TRUSTED), {
+        jsonrpc: "2.0",
+        id: 4,
+        error: { code, message: "rejected" },
+      });
+      await exporter.flush();
+
+      const [span] = spans();
+      expect(span?.name).toBe(REJECTED_SPAN_NAME);
+      expect(span?.events).toEqual([]);
+      expect(span?.attributes["acs.request_id"]).toBeUndefined();
+      expect(span?.attributes["acs.session.id"]).toBeUndefined();
+      expect(span?.attributes["guardian.rejected.claimed_request_id"]).toBe(requestId);
+      expect(span?.attributes["guardian.rejected.reason"]).toBe(reason);
+      expect(span?.attributes["guardian.rejected.error_code"]).toBe(code);
     });
+  }
+
+  it("records a request the Guardian did not trust as a rejected request, with the reason it was given", async () => {
+    const { exporter, spans } = memoryExporter();
+    const requestId = crypto.randomUUID();
+    const handle = exporter.start(toolCallEnvelope("ls", { id: 5, requestId }), "steps/toolCallRequest", {
+      trusted: false,
+      reason: "guardian_fault",
+    });
+    expect(handle).not.toBeNull();
+    exporter.end(handle, { jsonrpc: "2.0", id: 5, error: { code: -32020, message: "schemas missing" } });
     await exporter.flush();
 
-    expect(spans()[0]?.events.map((event) => event.name)).toEqual([]);
+    const [span] = spans();
+    expect(span?.name).toBe(REJECTED_SPAN_NAME);
+    expect(span?.events).toEqual([]);
+    expect(span?.attributes["acs.request_id"]).toBeUndefined();
+    expect(span?.attributes["guardian.rejected.claimed_request_id"]).toBe(requestId);
+    expect(span?.attributes["guardian.rejected.reason"]).toBe("guardian_fault");
+    expect(span?.status.code).toBe(SpanStatusCode.ERROR);
+  });
+
+  it("counts the time before the span opened toward a late decision", async () => {
+    const { exporter, spans } = memoryExporter({ timeoutConfig: { default_ms: 50 } });
+    const handle = exporter.start(toolCallEnvelope("ls", { id: 6 }), "steps/toolCallRequest", {
+      trusted: true,
+      receivedAt: performance.now() - 100,
+    });
+    exporter.end(handle, decisionResponse(6, { decision: "allow" }));
+    await exporter.flush();
+
+    const failure = spans()[0]?.events.find((event) => event.name === "acs.decision.failure");
+    expect(failure?.attributes?.["acs.failure.class"]).toBe("timeout");
   });
 
   // #228: acs.provenance.source_id is emitted only when at least one attached
