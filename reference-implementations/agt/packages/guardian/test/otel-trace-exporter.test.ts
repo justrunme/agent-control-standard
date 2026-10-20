@@ -810,6 +810,21 @@ describe("Guardian trace export wiring", () => {
     });
   }
 
+  it("records a schema-invalid envelope for a method it does not dispatch as a rejected request too", async () => {
+    const { exporter, spans } = memoryExporter();
+    const guardian = await startGuardian({ ...baseOptions, traceExporter: exporter });
+    try {
+      const bad = makeEnvelope("steps/sessionStart", {}, { id: 44 });
+      delete (bad.params as Record<string, unknown>).acs_version;
+      await postRaw(guardian.url, bad);
+      await exporter.flush();
+
+      expect(spans().map((span) => span.name)).toEqual([REJECTED_SPAN_NAME]);
+    } finally {
+      await guardian.close();
+    }
+  });
+
   it("records an invalid envelope answered with a bare error as a rejected request, with no decision failure", async () => {
     const { exporter, spans } = memoryExporter();
     const guardian = await startGuardian({ ...baseOptions, traceExporter: exporter });
@@ -1224,11 +1239,49 @@ describe("createOtelTraceExporter -- review fixes", () => {
 
     const [span] = spans();
     expect(span?.name).toBe(REJECTED_SPAN_NAME);
-    expect(span?.events).toEqual([]);
     expect(span?.attributes["acs.request_id"]).toBeUndefined();
     expect(span?.attributes["guardian.rejected.claimed_request_id"]).toBe(requestId);
     expect(span?.attributes["guardian.rejected.reason"]).toBe("guardian_fault");
     expect(span?.status.code).toBe(SpanStatusCode.ERROR);
+    // The host got an error, so the step went ungoverned: still a decision
+    // failure, recorded on a span and event that carry no pair.
+    expect(span?.events.map((event) => event.attributes?.["acs.failure.class"])).toEqual(["guardian_error"]);
+    expect(span?.events[0]?.attributes?.["acs.request_id"]).toBeUndefined();
+  });
+
+  it("carries none of a rejected result's step attributes, so acs.request_id_ref cannot name the genuine call", async () => {
+    const { exporter, spans } = memoryExporter();
+    const genuineCall = crypto.randomUUID();
+    const forgedResult = makeEnvelope(
+      "steps/toolCallResult",
+      { tool: { name: "run_shell" }, exit_status: "success", outputs: [{ value: "ok" }], request_id_ref: genuineCall },
+      { id: 8 },
+    );
+    exporter.end(exporter.start(forgedResult, "steps/toolCallResult", TRUSTED), {
+      jsonrpc: "2.0",
+      id: 8,
+      error: { code: -32005, message: "replay" },
+    });
+    await exporter.flush();
+
+    const [span] = spans();
+    expect(span?.name).toBe(REJECTED_SPAN_NAME);
+    expect(span?.attributes["acs.request_id_ref"]).toBeUndefined();
+    expect(span?.attributes["gen_ai.tool.name"]).toBeUndefined();
+    expect(Object.keys(span?.attributes ?? {}).every((key) => key.startsWith("guardian.rejected."))).toBe(true);
+  });
+
+  it("records a step dispatch rejected as a rejected request even when it answered with a deny", async () => {
+    const { exporter, spans } = memoryExporter();
+    const handle = exporter.start(toolCallEnvelope("ls", { id: 9 }), "steps/toolCallRequest", TRUSTED);
+    exporter.end(handle, decisionResponse(9, { decision: "deny", reason_codes: ["signature_invalid"] }), "signature_invalid");
+    await exporter.flush();
+
+    const [span] = spans();
+    expect(span?.name).toBe(REJECTED_SPAN_NAME);
+    expect(span?.events).toEqual([]);
+    expect(span?.attributes["acs.request_id"]).toBeUndefined();
+    expect(span?.attributes["guardian.rejected.reason"]).toBe("signature_invalid");
   });
 
   it("counts the time before the span opened toward a late decision", async () => {
@@ -1240,8 +1293,12 @@ describe("createOtelTraceExporter -- review fixes", () => {
     exporter.end(handle, decisionResponse(6, { decision: "allow" }));
     await exporter.flush();
 
-    const failure = spans()[0]?.events.find((event) => event.name === "acs.decision.failure");
+    const [span] = spans();
+    const failure = span?.events.find((event) => event.name === "acs.decision.failure");
     expect(failure?.attributes?.["acs.failure.class"]).toBe("timeout");
+    // The span starts at arrival too, so its own duration covers the 100 ms.
+    const durationMs = (span?.duration[0] ?? 0) * 1000 + (span?.duration[1] ?? 0) / 1e6;
+    expect(durationMs).toBeGreaterThanOrEqual(90);
   });
 
   // #228: acs.provenance.source_id is emitted only when at least one attached

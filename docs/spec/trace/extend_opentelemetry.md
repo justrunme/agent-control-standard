@@ -24,13 +24,25 @@ The span carries the join pair (`acs.session.id` and `acs.request_id`), the tool
 
 ```json
 {
-  "traceId": "d327f235c726545b0c17f6401efd98d1",
-  "spanId": "ec45435f512ec8ab",
+  "traceId": "13717f291e2368066d2fa3f2434ed2f6",
+  "spanId": "2a7efedbb7ee3881",
   "name": "gen_ai.tool.call",
   "kind": 1,
-  "startTimeUnixNano": "1792533584275000000",
-  "endTimeUnixNano": "1792533584341659625",
+  "startTimeUnixNano": "1792534253716796645",
+  "endTimeUnixNano": "1792534253780000000",
   "attributes": [
+    {
+      "key": "acs.session.id",
+      "value": {
+        "stringValue": "5a3c1e7e-0b1d-4c6a-9e2f-7d4b8c0a1f01"
+      }
+    },
+    {
+      "key": "acs.request_id",
+      "value": {
+        "stringValue": "1b6f0c2a-3d4e-4f5a-8b6c-7d8e9f0a1b03"
+      }
+    },
     {
       "key": "gen_ai.tool.name",
       "value": {
@@ -65,18 +77,6 @@ The span carries the join pair (`acs.session.id` and `acs.request_id`), the tool
             }
           ]
         }
-      }
-    },
-    {
-      "key": "acs.session.id",
-      "value": {
-        "stringValue": "5a3c1e7e-0b1d-4c6a-9e2f-7d4b8c0a1f01"
-      }
-    },
-    {
-      "key": "acs.request_id",
-      "value": {
-        "stringValue": "1b6f0c2a-3d4e-4f5a-8b6c-7d8e9f0a1b03"
       }
     }
   ],
@@ -146,7 +146,7 @@ The span carries the join pair (`acs.session.id` and `acs.request_id`), the tool
         }
       ],
       "name": "acs.decision",
-      "timeUnixNano": "1792533584341654208",
+      "timeUnixNano": "1792534253780000000",
       "droppedAttributesCount": 0
     }
   ],
@@ -168,7 +168,7 @@ The span above is real output from the reference Guardian. This section explains
 
 ### Two streams, joined by a reader
 
-No single process sees every outcome of a step. The Guardian sees each request it receives and the answer it gives. It exports one span per step it trusted, with the `acs.decision` event on it, and records a request it rejected before trusting it apart, under names other than `acs.session.id` and `acs.request_id`. It also reports the failures it can see itself: an error it returned instead of a decision, a decision it finished after the negotiated timeout, and a step still open when it shut down.
+No single process sees every outcome of a step. The Guardian sees each request it receives and the answer it gives. It exports one span per step it trusted, with the `acs.decision` event on it, and records a request it rejected before trusting it apart, under names other than `acs.session.id` and `acs.request_id`. It also reports the failures it can see itself: an error it returned instead of a decision because it could not handle the step, a decision it finished after the negotiated timeout, and a step still open when it shut down.
 
 The host sees what the Guardian can't. An unreachable Guardian has nothing to record. A Guardian whose answer arrives after the host stopped waiting can't see what the host did in the meantime. The host adapter records both cases in its own audit log. A converter, `audit-to-otlp.ts`, turns that log into spans of the same OTLP/JSON shape, each with an `acs.decision.failure` event whose `acs.failure.reported_by` is `observed_agent`.
 
@@ -224,7 +224,7 @@ sequenceDiagram
 
 A late decision gets both events on one span: the `acs.decision` with the verdict, then an `acs.decision.failure` with class `timeout`. When either party's stream holds a failure event for a pair, a reader doesn't count that pair's `acs.decision` as enforced. [Trace Events](./events.md) states that rule.
 
-The Guardian never copies its error text into the trace. A failure event carries the error code, the timeout, the elapsed time and the request size when they're known, because error text can quote the request. A replay rejection gets no failure event, since its pair belongs to the earlier request.
+The Guardian never copies its error text into the trace. A failure event carries the error code, the timeout, the elapsed time and the request size when they're known, because error text can quote the request. A request the Guardian rejected before trusting it, by a failed validation, signature, replay or timestamp check, gets no event under the pair it carried, since that pair can be a genuine request's. The reference Guardian records it as a separate span under its own names instead.
 
 If you only need to read a trace, you can stop here. The rest of this section is for running the pipeline or building your own.
 

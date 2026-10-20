@@ -26,6 +26,11 @@ const PROVENANCE_COLUMN_LIMIT = 64;
  * earlier request, so #228 forbids a failure event for it: one would mark
  * that earlier, legitimate decision as not enforced. */
 export const REPLAY_DETECTED_CODE = -32005;
+/** JSON-RPC SIGNATURE_INVALID and TIMESTAMP_OUT_OF_WINDOW (Specification
+ * §17.1). Defined here beside REPLAY_DETECTED_CODE so the Guardian's checks
+ * and the trace's rejection mapping read one number for each. */
+export const SIGNATURE_INVALID_CODE = -32004;
+export const TIMESTAMP_OUT_OF_WINDOW_CODE = -32006;
 
 // The repository's own mapping, five directories up from this file, the
 // same relationship SCHEMA_ROOT in validate-envelope.ts relies on.
@@ -77,15 +82,15 @@ export type RejectionReason =
 
 /**
  * The §17.1 codes that mean the Guardian rejected a request before trusting
- * it. A step answered with one of these is recorded as a rejected request
- * even when the check that produced it ran after its span opened, so a
- * signature, replay or timestamp check added inside dispatch cannot put a
- * rejected request's ids back on a step span.
+ * it. dispatch reports its own rejections to the exporter directly. This is
+ * the backstop: a step answered with one of these codes is recorded as a
+ * rejected request even if the check that produced it forgot to report, so
+ * a rejected request's ids never land on a step span.
  */
 export const PRE_TRUST_REJECTION_CODES: ReadonlyMap<number, RejectionReason> = new Map([
-  [-32004, "signature_invalid"],
+  [SIGNATURE_INVALID_CODE, "signature_invalid"],
   [REPLAY_DETECTED_CODE, "replay_detected"],
-  [-32006, "timestamp_out_of_window"],
+  [TIMESTAMP_OUT_OF_WINDOW_CODE, "timestamp_out_of_window"],
 ]);
 
 /** The event's attribute keys: the three required ones first, then the

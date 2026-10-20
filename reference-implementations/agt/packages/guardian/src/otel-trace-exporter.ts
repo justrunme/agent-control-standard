@@ -162,6 +162,10 @@ export type StepSpan = {
    * as acs.session.id and acs.request_id only when it ends as a trusted step
    * (see `finish`), and under the rejected names otherwise. */
   readonly claimed: Attributes;
+  /** Every other step attribute, read from the request and held back the
+   * same way, so a span that ends as a rejected request carries none of
+   * them (`acs.request_id_ref` on a forged result names a genuine call). */
+  readonly held: Attributes;
   /** Set when the request was rejected before its span opened. */
   readonly rejected?: RejectionReason;
 };
@@ -195,7 +199,10 @@ export type OtelTraceExporter = {
    * `payloadBytes` is the request body's size, for the failure event. An
    * untrusted request produces a rejected-request span (see StepStart). */
   start(envelope: unknown, method: string | null, step: StepStart): StepSpan | null;
-  end(stepSpan: StepSpan | null, response: unknown): void;
+  /** `rejection` is set when the Guardian rejected the request before
+   * trusting it after the span opened (a signature, replay or timestamp
+   * check inside dispatch), whatever shape its answer took. */
+  end(stepSpan: StepSpan | null, response: unknown, rejection?: RejectionReason): void;
   /** Pushes every ended span through to the exporters now rather than on
    * the batch timer. Tests call it; shutdown does too. */
   flush(): Promise<void>;
@@ -461,31 +468,37 @@ export function createOtelTraceExporter({
   }
 
   function begin(envelope: unknown, method: string | null, step: StepStart, tracer: Tracer, mapping: OtelMapping): StepSpan | null {
+    const parts = requestParts(envelope);
+    // Held back, not set: the pair, and every other step attribute, goes on
+    // only when the span ends as a trusted step, because a check that runs
+    // after this point can still reject the request.
+    const claimed: Attributes = {};
+    collect(claimed, Object.keys(CORRELATION_ATTRIBUTE_SOURCES), CORRELATION_ATTRIBUTE_SOURCES, parts);
+    const startedAt = step.receivedAt ?? performance.now();
+    // The span's own start is the arrival too, so its duration agrees with
+    // the elapsed time the failure event reports.
+    const startTime = step.receivedAt;
+    // A rejected request is recorded whatever its method, handled or not:
+    // its span needs no step_to_span entry.
+    if (!step.trusted) {
+      const rejected: StepSpan = {
+        span: tracer.startSpan(REJECTED_SPAN_NAME, { attributes: rejectedAttributes(claimed, step.reason), root: true, startTime }),
+        method: method ?? "",
+        startedAt,
+        payloadBytes: step.payloadBytes,
+        claimed,
+        held: {},
+        rejected: step.reason,
+      };
+      openSpans.add(rejected);
+      return rejected;
+    }
     if (method === null || !handled.has(method)) {
       return null;
     }
     const entry = mapping.stepToSpan[method];
     if (entry === undefined) {
       return null;
-    }
-    const parts = requestParts(envelope);
-    // Held back, not set: the pair goes on only when the span ends as a
-    // trusted step, because a check that runs after this point can still
-    // reject the request (see PRE_TRUST_REJECTION_CODES).
-    const claimed: Attributes = {};
-    collect(claimed, Object.keys(CORRELATION_ATTRIBUTE_SOURCES), CORRELATION_ATTRIBUTE_SOURCES, parts);
-    const startedAt = step.receivedAt ?? performance.now();
-    if (!step.trusted) {
-      const rejected: StepSpan = {
-        span: tracer.startSpan(REJECTED_SPAN_NAME, { attributes: rejectedAttributes(claimed, step.reason), root: true }),
-        method,
-        startedAt,
-        payloadBytes: step.payloadBytes,
-        claimed,
-        rejected: step.reason,
-      };
-      openSpans.add(rejected);
-      return rejected;
     }
     const attributes: Attributes = {};
     collect(
@@ -507,42 +520,46 @@ export function createOtelTraceExporter({
       }
     }
     const stepSpan: StepSpan = {
-      span: tracer.startSpan(entry.span_name, { attributes, root: true }),
+      span: tracer.startSpan(entry.span_name, { root: true, startTime }),
       method,
       startedAt,
       payloadBytes: step.payloadBytes,
       claimed,
+      held: attributes,
     };
     openSpans.add(stepSpan);
     return stepSpan;
   }
 
   /** Ends a span as a rejected request: renamed if it opened as a step, the
-   * claimed ids under the rejected names, no ACS pair and no event. */
+   * claimed ids under the rejected names, and no ACS pair, step attribute or
+   * decision event. A Guardian fault is still a decision failure for the
+   * host, which got an error, so it keeps that event, on a span with no pair. */
   function finishRejected(stepSpan: StepSpan, reason: RejectionReason, errorCode?: number): void {
     const { span } = stepSpan;
     span.updateName(REJECTED_SPAN_NAME);
     span.setAttributes(rejectedAttributes(stepSpan.claimed, reason, errorCode));
     span.setStatus({ code: SpanStatusCode.ERROR, message: REJECTED_STATUS });
+    if (reason === "guardian_fault") {
+      span.addEvent(DECISION_FAILURE_EVENT, failureAttributes(stepSpan, "guardian_error", { errorCode }));
+    }
     span.end();
   }
 
-  function finish(stepSpan: StepSpan, envelope: unknown, mapping: OtelMapping): void {
+  function finish(stepSpan: StepSpan, envelope: unknown, mapping: OtelMapping, rejection: RejectionReason | undefined): void {
     const { span } = stepSpan;
     const error = asObject(asObject(envelope)?.error);
     const errorCode = asNumber(error?.code);
-    if (stepSpan.rejected !== undefined) {
-      finishRejected(stepSpan, stepSpan.rejected, errorCode);
+    // Rejected before the span opened, rejected by a check after it opened,
+    // or answered with a code that only a rejection carries: each ends as a
+    // rejected request, and no held attribute reaches it.
+    const reason =
+      stepSpan.rejected ?? rejection ?? (errorCode === undefined ? undefined : PRE_TRUST_REJECTION_CODES.get(errorCode));
+    if (reason !== undefined) {
+      finishRejected(stepSpan, reason, errorCode);
       return;
     }
-    // A check that ran after the span opened rejected the request: it ends
-    // as a rejected request too, and the claimed pair never reaches it.
-    const lateRejection = errorCode === undefined ? undefined : PRE_TRUST_REJECTION_CODES.get(errorCode);
-    if (lateRejection !== undefined) {
-      finishRejected(stepSpan, lateRejection, errorCode);
-      return;
-    }
-    span.setAttributes(stepSpan.claimed);
+    span.setAttributes({ ...stepSpan.claimed, ...stepSpan.held });
     const decision = resultParts(envelope);
     if (decision === undefined) {
       // A JSON-RPC error: the step was answered but not decided. The first
@@ -586,7 +603,7 @@ export function createOtelTraceExporter({
         return null;
       }
     },
-    end(stepSpan, response): void {
+    end(stepSpan, response, rejection): void {
       if (stepSpan === null) {
         return;
       }
@@ -597,7 +614,7 @@ export function createOtelTraceExporter({
         return;
       }
       try {
-        finish(stepSpan, response, mapping);
+        finish(stepSpan, response, mapping, rejection);
       } catch (error) {
         fail(error);
       }
@@ -627,7 +644,7 @@ export function createOtelTraceExporter({
               finishRejected(stepSpan, stepSpan.rejected);
               continue;
             }
-            stepSpan.span.setAttributes(stepSpan.claimed);
+            stepSpan.span.setAttributes({ ...stepSpan.claimed, ...stepSpan.held });
             stepSpan.span.addEvent(
               DECISION_FAILURE_EVENT,
               failureAttributes(stepSpan, "other", { detail: "the Guardian shut down before it answered this step" }),
